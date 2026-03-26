@@ -27,6 +27,33 @@ ALLOWED_MEETINGS = ['(VIC)', '(NSW)', '(QLD)', '(SA)', '(WA)', '(NT)', '(TAS)', 
 FS = {}
 SR = {}
 
+def _normalize_meeting_name(name: str) -> str:
+    return str(name).strip().lower().replace("-", " ")
+
+def get_target_meeting_from_excel(excel_file: str) -> str | None:
+    """
+    Reads the meeting/track name from cell G1 of the workbook's active sheet.
+    If empty, returns None and the scraper will process all meetings (current behavior).
+    """
+    try:
+        wb = load_workbook(filename=excel_file, keep_vba=True, data_only=True, read_only=True)
+    except Exception as e:
+        print(f"⚠️ Could not open workbook '{excel_file}' to read G1: {e}")
+        return None
+
+    try:
+        ws = wb.active
+        raw = ws["G1"].value
+        if raw is None:
+            return None
+        val = str(raw).strip()
+        return val or None
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
 def _create_chrome_service():
     """
     Prefer an explicitly configured chromedriver path when present.
@@ -157,7 +184,7 @@ def extract_FS(driver, url, meetings_names):
                 break
 
 
-def get_meetings(driver, url):
+def get_meetings(driver, url, target_meeting: str | None = None):
     try:
         driver.get(url, )
     except:
@@ -180,6 +207,20 @@ def get_meetings(driver, url):
 
     html = driver.page_source
     meetings_names, rounds_links = find_all_races(html=html)
+
+    if target_meeting:
+        target_norm = _normalize_meeting_name(target_meeting)
+        meetings_names = [target_norm]
+
+        def _href_meeting_norm(href: str) -> str:
+            parts = str(href).split("/")
+            # Expected: /racing/meeting/<meeting-slug>/race/<n> ...
+            if len(parts) > 3:
+                return _normalize_meeting_name(parts[3])
+            return ""
+
+        rounds_links = [h for h in rounds_links if _href_meeting_norm(h) == target_norm]
+        print(f"🎯 Target meeting from Excel (G1): '{target_meeting}' → {len(rounds_links)} race links")
 
 
     for i in range(rounds_links.__len__()):
@@ -276,7 +317,8 @@ def merge_excel(excel_file, FS):
 def main():
     
     driver = setup_driver()
-    get_meetings(driver=driver, url=BASE_URL + "/racing/meetings/today/")
+    target_meeting = get_target_meeting_from_excel(FILE_NAME)
+    get_meetings(driver=driver, url=BASE_URL + "/racing/meetings/today/", target_meeting=target_meeting)
 
     merge_excel(FILE_NAME, FS)
 
