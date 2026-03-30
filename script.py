@@ -4,6 +4,7 @@
 import re
 import time
 import os
+import sys
 from pathlib import Path
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -14,6 +15,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from webdriver_manager.chrome import ChromeDriverManager
+from fake_useragent import UserAgent
 
 ChromeDriverPath = "C:/chromedriver/chromedriver.exe"
 
@@ -23,6 +25,21 @@ target_column = 23
 ALLOWED_MEETINGS = ['(VIC)', '(NSW)', '(QLD)', '(SA)', '(WA)', '(NT)', '(TAS)', '(ACT)', '(NZ)', '(NZL)']
 FS = {}
 SR = {}
+
+def _get_user_agent() -> str:
+    try:
+        ua = UserAgent()
+        s = ua.random
+        if isinstance(s, str) and s.strip():
+            return s.strip()
+    except Exception:
+        pass
+    # Reasonable fallback (Chrome on Windows 10-ish)
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
 
 def _normalize_meeting_name(name: str) -> str:
     s = str(name)
@@ -120,6 +137,7 @@ def setup_driver():
     options.add_argument("--disable-images")
     options.add_argument("--start-maximized")
     options.add_argument("--disable-popup-blocking")
+    options.add_argument(f"--user-agent={_get_user_agent()}")
     options.add_argument("--lang=en-AU,en")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--disable-dev-shm-usage")
@@ -128,6 +146,10 @@ def setup_driver():
     options.add_argument("--no-first-run")
     options.add_argument("--disable-site-isolation-trials")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--log-level=3")
+    options.add_argument("--disable-logging")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
 
     # Reduce obvious automation fingerprints
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -147,11 +169,18 @@ def setup_driver():
         options.add_argument("--ignore-certificate-errors")
         options.add_argument("--allow-insecure-localhost")
 
+    # Prefer explicit driver when provided; otherwise allow Selenium Manager to choose.
+    # If we do use a Service and session creation fails, retry with Selenium Manager.
     service = _create_chrome_service()
-    if service is None:
+    try:
+        if service is None:
+            driver = webdriver.Chrome(options=options)
+        else:
+            driver = webdriver.Chrome(service=service, options=options)
+    except Exception as e:
+        print(f"WARNING: Chrome failed to start with Service driver ({type(e).__name__}). Retrying with Selenium Manager.")
         driver = webdriver.Chrome(options=options)
-    else:
-        driver = webdriver.Chrome(service=service, options=options)
+
     driver.set_page_load_timeout(800)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     
@@ -322,18 +351,45 @@ def merge_excel(excel_file, FS):
 
     workbook = load_workbook(filename=excel_file, keep_vba=True)
 
-    def normalize(name):
-        return name.strip().lower().replace("-", " ")
+    def normalize_sheet_key(val: object) -> str:
+        return _normalize_meeting_name("" if val is None else str(val))
 
-    # Normalize all sheet names
-    normalized_sheet_map = {normalize(name): name for name in workbook.sheetnames}
+    # Build mapping: normalized(meeting name in G1) -> sheet tab name.
+    # This supports workbooks where sheets are named "Sheet1", etc.
+    normalized_sheet_map: dict[str, str] = {}
+    dup_keys: dict[str, list[str]] = {}
+
+    for ws in workbook.worksheets:
+        g1 = _cell_value_with_merges(ws, "G1")
+        if g1 is None or str(g1).strip() == "":
+            continue
+        key = normalize_sheet_key(g1)
+        if not key:
+            continue
+        if key in normalized_sheet_map and normalized_sheet_map[key] != ws.title:
+            dup_keys.setdefault(key, [normalized_sheet_map[key]]).append(ws.title)
+            # keep first match
+            continue
+        normalized_sheet_map[key] = ws.title
 
     print("\nSheets in workbook:")
     for k, v in normalized_sheet_map.items():
-        print(f"  '{k}'  ->  '{v}'")
+        print(f"  key='{k}'  ->  sheet='{v}'")
+    if dup_keys:
+        print("\nWARNING: Duplicate meeting keys found in G1 (keeping first):")
+        for k, sheets in dup_keys.items():
+            print(f"  key='{k}' sheets={sheets}")
 
     print("\nFS meetings loaded:", list(FS.keys()))
     print("SR meetings loaded:", list(SR.keys()))
+
+    def normalize_horse(name: str) -> str:
+        # Make matching resilient to "1. HORSE" style labels and punctuation.
+        s = str(name).strip().upper()
+        s = re.sub(r"^\\d+\\s*[\\.)-]?\\s*", "", s)
+        s = s.replace(".", "")
+        s = re.sub(r"\\s+", " ", s).strip()
+        return s
 
     # --- PROCESS FS (TAB FS) ---
     print("\n==============================")
@@ -341,10 +397,10 @@ def merge_excel(excel_file, FS):
     print("==============================")
 
     for raw_sheet_name, horses in FS.items():
-        norm_name = normalize(raw_sheet_name)
+        norm_name = normalize_sheet_key(raw_sheet_name)
         actual_sheet_name = normalized_sheet_map.get(norm_name)
 
-        print(f"\n➡ Meeting FS: '{raw_sheet_name}' normalized to '{norm_name}'")
+        print(f"\nMeeting FS: '{raw_sheet_name}' normalized to '{norm_name}'")
 
         if not actual_sheet_name:
             print(f"NO matching sheet found for FS meeting: {raw_sheet_name}")
@@ -355,14 +411,18 @@ def merge_excel(excel_file, FS):
 
         sheet = workbook[actual_sheet_name]
 
+        horses_norm = {normalize_horse(k): v for k, v in horses.items()}
         for row in sheet.iter_rows(min_row=1):
-            for cell in row:
-                horse_name = str(cell.value).strip() if cell.value else ""
-                if horse_name in horses:
-                    fs_value = horses[horse_name]
-                    sheet.cell(row=cell.row, column=23, value=fs_value)
-
-                    print(f"   ➕ FS Saved | Row {cell.row} | Horse: '{horse_name}' | Value: {fs_value}")
+            if len(row) < 4:
+                continue
+            horse_cell = row[3]  # Column D
+            if not horse_cell.value:
+                continue
+            excel_horse = normalize_horse(str(horse_cell.value))
+            if excel_horse in horses_norm:
+                fs_value = horses_norm[excel_horse]
+                sheet.cell(row=horse_cell.row, column=23, value=fs_value)  # W
+                print(f"   FS Saved | Row {horse_cell.row} | Horse: '{horse_cell.value}' | Value: {fs_value}")
 
 
     # --- PROCESS SKY RATING ---
@@ -371,10 +431,10 @@ def merge_excel(excel_file, FS):
     print("==============================")
 
     for raw_sheet_name, horses in SR.items():
-        norm_name = normalize(raw_sheet_name)
+        norm_name = normalize_sheet_key(raw_sheet_name)
         actual_sheet_name = normalized_sheet_map.get(norm_name)
 
-        print(f"\n➡ Meeting SR: '{raw_sheet_name}' normalized to '{norm_name}'")
+        print(f"\nMeeting SR: '{raw_sheet_name}' normalized to '{norm_name}'")
 
         if not actual_sheet_name:
             print(f"NO matching sheet found for SR meeting: {raw_sheet_name}")
@@ -385,14 +445,18 @@ def merge_excel(excel_file, FS):
 
         sheet = workbook[actual_sheet_name]
 
+        horses_norm = {normalize_horse(k): v for k, v in horses.items()}
         for row in sheet.iter_rows(min_row=1):
-            for cell in row:
-                horse_name = str(cell.value).strip() if cell.value else ""
-                if horse_name in horses:
-                    sky_value = horses[horse_name]
-                    sheet.cell(row=cell.row, column=24, value=sky_value)
-
-                    print(f"   Sky Saved | Row {cell.row} | Horse: '{horse_name}' | Value: {sky_value}")
+            if len(row) < 4:
+                continue
+            horse_cell = row[3]  # Column D
+            if not horse_cell.value:
+                continue
+            excel_horse = normalize_horse(str(horse_cell.value))
+            if excel_horse in horses_norm:
+                sky_value = horses_norm[excel_horse]
+                sheet.cell(row=horse_cell.row, column=24, value=sky_value)  # X
+                print(f"   Sky Saved | Row {horse_cell.row} | Horse: '{horse_cell.value}' | Value: {sky_value}")
 
     workbook.save(excel_file)
     print("\n==============================")
@@ -402,7 +466,11 @@ def merge_excel(excel_file, FS):
 
 
 def main():
-    
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    except Exception:
+        pass
+
     driver = setup_driver()
     target_meetings = get_target_meetings_from_excel(FILE_NAME)
     get_meetings(driver=driver, url=BASE_URL + "/racing/meetings/today/", target_meetings=target_meetings)
